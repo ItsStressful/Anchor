@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Smart Academic Planner</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Fonts + basic style (keeps your vibe) -->
+  <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg:#fafafa; --card:#ffffff; --border:#e7e7e7; --ink:#111; --muted:#666; }
+    html, body { margin:0; padding:0; background:var(--bg); color:var(--ink); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .page-wrapper { max-width: 1100px; margin: 32px auto; padding: 0 16px; }
+    .hero { text-align:left; margin-bottom:24px; }
+    .hero-heading { font-family:"Source Serif 4", serif; font-size:2.2rem; margin:0 0 8px 0; }
+    .hero-subheading { color:var(--muted); margin:0; }
+    .upload-box, .results-box, .chat-box { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:16px; }
+    .upload-box label { display:block; margin-bottom:8px; font-weight:600; }
+    .upload-box input[type="file"] { display:block; margin-bottom:8px; }
+    .upload-box button { padding:8px 12px; border:1px solid var(--border); background:#111; color:#fff; border-radius:8px; cursor:pointer; }
+    .scroll-table { overflow-x:auto; }
+    table { border-collapse:collapse; width:100%; }
+    th, td { border:1px solid #dedede; padding:0.75rem; vertical-align:top; text-align:left; }
+    th { background:#f3ebe2; font-weight:600; }
+    .unit-total td { background:#f9f5f0; font-weight:500; }
+    .layout { display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap; }
+    .main-col { flex:2; min-width:540px; }
+    .chat-col { flex:1; min-width:320px; }
+    .chat-log { height:320px; overflow:auto; padding:8px; border:1px solid #eee; border-radius:8px; background:#fafafa; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .chat-msg { margin:6px 0; white-space:pre-wrap; }
+    .chat-msg.user { color:#1d4ed8; }
+    .chat-msg.assistant { color:#0f766e; }
+    .row { display:flex; gap:8px; margin-top:8px; }
+    .row input { flex:1; }
+    .muted { color:#666; font-size:0.9rem; }
+    .pill { display:inline-block; font-size:.8rem; padding:2px 8px; border:1px solid var(--border); border-radius:999px; }
+  </style>
+
+  <!-- pdf.js (client-side PDF text extraction) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>
+    // Pin the worker for pdf.js
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  </script>
+
+  <!-- WebLLM loader with multi-CDN fallback (no API key, runs in-browser) -->
+  <script>
+  (async function loadWebLLM() {
+    const cdns = [
+      "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.79/dist/index.min.js",
+      "https://unpkg.com/@mlc-ai/web-llm@0.2.79/dist/index.min.js",
+      "https://esm.sh/@mlc-ai/web-llm@0.2.79/dist/index.min.js"
+    ];
+    for (const src of cdns) {
+      try {
+        await new Promise((res, rej) => {
+          const s = document.createElement("script");
+          s.src = src; s.async = true; s.onload = res; s.onerror = rej;
+          document.head.appendChild(s);
+        });
+        if (window.webllm) return;
+      } catch {}
+    }
+    console.error("WebLLM failed to load from all CDNs.");
+  })();
+  </script>
+</head>
+<body>
+  <div class="page-wrapper">
+    <header class="hero">
+      <div class="pill">100% free • runs in your browser</div>
+      <h1 class="hero-heading">🎓 Planner that works for you.</h1>
+      <p class="hero-subheading">Upload your degree audit and get a personalized 4-year plan in seconds.</p>
+    </header>
+
+    <div class="layout">
+      <div class="main-col">
+        <form id="upload-form" class="upload-box">
+          <label for="audit">Upload a Degree Audit (PDF or TXT)</label>
+          <input id="audit" type="file" accept=".pdf,.txt" required />
+          <button id="generate-btn" type="submit">Generate My Plan</button>
+          <div id="status" class="muted" style="margin-top:8px;"></div>
+        </form>
+
+        <div class="results-box" id="results" style="display:none;">
+          <h2>📅 4-Year Plan</h2>
+          <div class="scroll-table" id="scroll-table"></div>
+        </div>
+      </div>
+
+      <aside class="chat-col">
+        <h2 style="margin:0 0 8px 0;">🗣️ Ask the Advisor</h2>
+        <div class="chat-box">
+          <div class="chat-log" id="chat-log"></div>
+          <div class="row">
+            <input id="chat-input" type="text" placeholder="Ask about prerequisites, alternatives, workload…" />
+            <button id="chat-send" type="button">Send</button>
+          </div>
+          <div class="muted" style="margin-top:6px">Model runs in your browser. First load can take a few minutes.</div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    // ---------- Config ----------
+    const ALL_TERMS = [
+      "Fall 2022","Winter 2023","Spring 2023","Summer 2023",
+      "Fall 2023","Winter 2024","Spring 2024","Summer 2024",
+      "Fall 2024","Winter 2025","Spring 2025","Summer 2025"
+    ];
+
+    const SYSTEM_RULES = `
+You are an academic advisor.
+
+Given a student's degree audit, generate a 4-year academic plan from Fall 2022 to Summer 2025 (max 12 quarters).
+
+Rules:
+- Include only future/planned courses (do not repeat completed).
+- Up to 4 courses per term.
+- Include "unit_total" per term.
+- Try not to exceed 16 units/term unless required.
+- Leave summers empty if not needed.
+- Fulfill all remaining requirements (major, GE, math/science, upper division, etc.).
+Return ONLY a valid JSON array. If uncertain, return "[]".
+Example:
+[
+  {"term":"Fall 2022","courses":[{"name":"CSE 110","category":"Major","units":4}],"unit_total":4}
+]`;
+
+    // ---------- Elements ----------
+    const uploadForm = document.getElementById('upload-form');
+    const fileInput  = document.getElementById('audit');
+    const statusEl   = document.getElementById('status');
+    const resultsBox = document.getElementById('results');
+    const tableEl    = document.getElementById('scroll-table');
+
+    const chatLog    = document.getElementById('chat-log');
+    const chatInput  = document.getElementById('chat-input');
+    const chatSend   = document.getElementById('chat-send');
+
+    // ---------- State ----------
+    let engine = null;
+    let chatHistory = [];
+    let lastAuditText = "";
+
+    // ---------- Utils ----------
+    function esc(s){return String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+
+    function extractFirstJSONArray(s){
+      const m = s.match(/\[\s*[\s\S]*\]/);
+      if (!m) throw new Error('No JSON array found in model output.');
+      return JSON.parse(m[0]);
+    }
+
+    function normalizePlan(plan, terms){
+      if (!Array.isArray(plan)) throw new Error('Plan is not a JSON array.');
+      const byTerm = {};
+      for (const t of plan) if (t && typeof t === 'object' && t.term) byTerm[t.term] = t;
+      const out = [];
+      for (const term of terms){
+        const t = byTerm[term] || { term, courses: [], unit_total: 0 };
+        const inCourses = Array.isArray(t.courses) ? t.courses.slice(0,4) : [];
+        const courses = [];
+        for (const c of inCourses){
+          if (!c || typeof c !== 'object') continue;
+          const name = String(c.name ?? '').trim(); if (!name) continue;
+          const category = String(c.category ?? '').trim();
+          const units = Number.isFinite(+c.units) ? parseInt(c.units,10) : 0;
+          courses.push({ name, category, units });
+        }
+        const unit_total = courses.reduce((a,c)=>a+(c.units||0),0);
+        out.push({ term, courses, unit_total });
+      }
+      return out;
+    }
+
+    function renderTable(terms, plan){
+      let html = '<table><tr>';
+      for (const t of terms) html += `<th>${t}</th>`;
+      html += '</tr>';
+
+      for (let row=0; row<4; row++){
+        html += '<tr>';
+        for (const term of terms){
+          const m = plan.find(p=>p.term===term);
+          if (m && m.courses[row]){
+            const c = m.courses[row];
+            html += `<td>${esc(c.name)}<br>${esc(c.category)}<br>${c.units} units</td>`;
+          } else html += '<td></td>';
+        }
+        html += '</tr>';
+      }
+
+      html += '<tr class="unit-total">';
+      for (const term of terms){
+        const m = plan.find(p=>p.term===term);
+        html += `<td>Unit Total: ${m ? m.unit_total : 0}</td>`;
+      }
+      html += '</tr></table>';
+      return html;
+    }
+
+    function addChat(role, text){
+      const div = document.createElement('div');
+      div.className = `chat-msg ${role}`;
+      div.textContent = (role === "user" ? "You: " : "Advisor: ") + text;
+      chatLog.appendChild(div);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    // ---------- PDF/TXT parsing (client-side) ----------
+    async function readFileAsText(file){
+      const name = file.name.toLowerCase();
+      if (name.endsWith(".txt")){
+        return await file.text();
+      } else if (name.endsWith(".pdf")){
+        const buf = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+        let out = "";
+        for (let i=1;i<=pdf.numPages;i++){
+          const page = await pdf.getPage(i);
+          const tc = await page.getTextContent();
+          out += tc.items.map(it => it.str).join(" ") + "\n";
+        }
+        return out;
+      } else {
+        throw new Error("Unsupported file type. Upload .pdf or .txt.");
+      }
+    }
+
+    // ---------- WebLLM init ----------
+    async function waitForWebLLM(timeoutMs=45000){
+      const start = Date.now();
+      while (!window.webllm){
+        if (Date.now() - start > timeoutMs) throw new Error("WebLLM failed to load.");
+        await new Promise(r => setTimeout(r,100));
+      }
+      const Create = window.webllm.CreateMLCEngine || window.webllm.CreateWebWorkerMLCEngine;
+      if (!Create) throw new Error("WebLLM API mismatch (no CreateMLCEngine/CreateWebWorkerMLCEngine).");
+      return Create;
+    }
+
+    async function ensureEngine(){
+      if (engine) return engine;
+      if (!navigator.gpu){
+        console.warn("WebGPU not available; fallback may be slow.");
+      }
+      statusEl.textContent = 'Loading model (first load can take a few minutes)…';
+      const Create = await waitForWebLLM();
+      // Use a browser-friendly, instruction-tuned model hosted by MLC
+      engine = await Create({
+        model: "Phi-3-mini-4k-instruct-q4f16_1",
+        model_id: "mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC"
+        // Alt:
+        // model: "Qwen2.5-3B-Instruct-q4f16_1",
+        // model_id: "mlc-ai/Qwen2.5-3B-Instruct-q4f16_1-MLC"
+      });
+      statusEl.textContent = 'Model ready ✓';
+      return engine;
+    }
+
+    // ---------- Generate Plan ----------
+    uploadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const file = fileInput.files[0];
+      if (!file){ statusEl.textContent = "Please choose a file."; return; }
+
+      try {
+        statusEl.textContent = "Reading audit…";
+        const text = (await readFileAsText(file)).trim();
+        if (!text){ statusEl.textContent = "Couldn’t extract text. If PDF is scanned, upload a .txt export."; return; }
+        lastAuditText = text;
+      } catch (err){
+        statusEl.textContent = "Error: " + err.message;
+        return;
+      }
+
+      try {
+        await ensureEngine();
+      } catch (err){
+        statusEl.textContent = "Model failed to load: " + (err?.message || err);
+        return;
+      }
+
+      statusEl.textContent = "Thinking…";
+      const prompt = `${SYSTEM_RULES.trim()}\n\nDegree audit:\n${lastAuditText}\n\nReturn ONLY the JSON array.`;
+
+      try {
+        const out = await engine.chat.completions.create({
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 900,
+          temperature: 0.2
+        });
+        const text = out?.choices?.[0]?.message?.content || '';
+        const plan = extractFirstJSONArray(text);
+        const safe = normalizePlan(plan, ALL_TERMS);
+        tableEl.innerHTML = renderTable(ALL_TERMS, safe);
+        resultsBox.style.display = '';
+        statusEl.textContent = "Done ✓";
+
+        // Seed chat
+        chatHistory = [
+          { role: "system", content: "You are a helpful academic advisor." },
+          { role: "user", content: "Here is my degree audit:\n" + lastAuditText.slice(0, 6000) },
+          { role: "assistant", content: "I generated a 4-year plan as JSON. Ask me anything about it." }
+        ];
+        addChat("assistant", "Plan created. Ask me about prerequisites, workload balance, or alternatives!");
+      } catch (err){
+        statusEl.textContent = "Error: " + (err?.message || err);
+      }
+    });
+
+    // ---------- Chat ----------
+    chatSend.addEventListener('click', sendChat);
+    chatInput.addEventListener('keydown', (e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendChat(); } });
+
+    async function sendChat(){
+      const msg = chatInput.value.trim();
+      if (!msg) return;
+      chatInput.value = "";
+      addChat("user", msg);
+
+      try {
+        await ensureEngine();
+        const messages = [...chatHistory, { role: "user", content: msg }];
+        const out = await engine.chat.completions.create({
+          messages, max_tokens: 400, temperature: 0.2
+        });
+        const reply = out?.choices?.[0]?.message?.content || "(no reply)";
+        addChat("assistant", reply);
+        chatHistory = messages.slice(-12).concat({ role: "assistant", content: reply });
+      } catch (e){
+        addChat("assistant", "Sorry—my local model had trouble responding. Try again.");
+      }
+    }
+  </script>
+</body>
+</html>
